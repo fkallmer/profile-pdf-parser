@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from .parser import parse_linkedin_pdf
+from .parser import parse_linkedin_pdf, parse_profile_pdf
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,12 +25,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="JSON indentation. Use 0 for compact JSON.",
     )
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Write the backward-compatible German-keyed output shape.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    parsed = parse_linkedin_pdf(args.pdf.read_bytes())
+    parse = parse_linkedin_pdf if args.legacy else parse_profile_pdf
+    parsed = parse(args.pdf.read_bytes())
     indent = None if args.indent == 0 else args.indent
     payload = json.dumps(parsed, ensure_ascii=False, indent=indent)
 

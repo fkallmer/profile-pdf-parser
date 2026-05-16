@@ -1,12 +1,7 @@
-"""
-Parser für LinkedIn-Profil-PDF-Exports.
+"""Parser for manually exported professional profile PDFs.
 
-LinkedIn-PDFs haben ein 2-Spalten-Layout:
-- Sidebar (links, ~28% Breite): Kontakt, Top-Kenntnisse, Languages
-- Main (rechts): Name + Headline + Berufserfahrung + Ausbildung
-
-Wir extrahieren reines Text, gruppieren nach Sektion via Keyword-Ankern und parsen
-mit Regex. Ergebnis ist ein Dict mit Vorschlägen, das im Frontend kuratiert wird.
+The parser is currently optimized for manually exported LinkedIn profile PDFs.
+It reads local PDF bytes only and returns plain Python dictionaries.
 """
 
 import io
@@ -17,9 +12,14 @@ from typing import Optional
 import pdfplumber
 
 
-# ── Konstanten ────────────────────────────────────────────────────────────────
+# Constants
 
-MONTHS_DE: dict[str, int] = {
+MONTHS: dict[str, int] = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sept": 9, "sep": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
     "januar": 1, "februar": 2, "märz": 3, "marz": 3, "april": 4, "mai": 5, "juni": 6,
     "juli": 7, "august": 8, "september": 9, "sept": 9, "oktober": 10, "okt": 10,
     "november": 11, "nov": 11, "dezember": 12, "dez": 12,
@@ -36,17 +36,41 @@ AGGREGATOR_RE = re.compile(
     re.I,
 )
 
-# "(Oktober 2024)" oder "(Oktober 2020 - August 2024)"
+# "(October 2024)" or "(October 2020 - August 2024)"
 PAREN_DATE_RE = re.compile(
     r"\((?P<von_m>[A-Za-zäöüÄÖÜ]+)\s+(?P<von_y>\d{4})"
     r"(?:\s*[-–—]\s*(?P<bis_m>[A-Za-zäöüÄÖÜ]+)\s+(?P<bis_y>\d{4}))?\)",
     re.I,
 )
 
-# Section-Marker im Main-Bereich
-SECTION_HEADERS = {"berufserfahrung", "ausbildung", "kenntnisse", "publikationen", "patente", "auszeichnungen"}
+# Section markers in the main content area.
+SECTION_HEADERS = {
+    "experience",
+    "work experience",
+    "professional experience",
+    "berufserfahrung",
+    "erfahrung",
+    "education",
+    "ausbildung",
+    "skills",
+    "top skills",
+    "kenntnisse",
+    "languages",
+    "sprachen",
+    "publications",
+    "publikationen",
+    "patents",
+    "patente",
+    "honors & awards",
+    "auszeichnungen",
+}
 
-# Abschluss-Mapping LinkedIn → unsere Werte
+SECTION_ALIASES = {
+    "experience": {"experience", "work experience", "professional experience", "berufserfahrung", "erfahrung"},
+    "education": {"education", "ausbildung"},
+}
+
+# Degree mapping from profile PDFs to compact labels.
 ABSCHLUSS_MAP: list[tuple[re.Pattern, str]] = [
     (re.compile(r"Bachelor of Science|\bB\.?Sc\b|\bBSc\b|\bBS\b", re.I), "B.Sc."),
     (re.compile(r"Bachelor of Arts|\bB\.?A\b|\bBA\b", re.I),                "B.A."),
@@ -60,28 +84,24 @@ ABSCHLUSS_MAP: list[tuple[re.Pattern, str]] = [
     (re.compile(r"Master of Business Administration|\bMBA\b", re.I),         "MBA"),
 ]
 
-# Erfahrungs-Typ aus Position ableiten
+# Derive experience type from the job title.
 ART_KEYWORDS: list[tuple[str, str]] = [
-    ("werkstudent", "werkstudent"),
-    ("working student", "werkstudent"),
-    ("praktikum", "praktikum"),
-    ("intern", "praktikum"),
-    ("internship", "praktikum"),
+    ("werkstudent", "working_student"),
+    ("working student", "working_student"),
+    ("praktikum", "internship"),
+    ("intern", "internship"),
+    ("internship", "internship"),
     ("freelance", "freelance"),
     ("freelancer", "freelance"),
-    ("vollzeit", "vollzeit"),
-    ("full-time", "vollzeit"),
+    ("vollzeit", "full_time"),
+    ("full-time", "full_time"),
 ]
 
 
-# ── PDF → Text ────────────────────────────────────────────────────────────────
+# PDF to text
 
 def _extract_columns(pdf_bytes: bytes) -> tuple[str, str]:
-    """Liest das PDF und gibt (sidebar_text, main_text) über alle Seiten zurück.
-
-    Verwendet `extract_words()` mit strikter x-Filterung, damit Sidebar-Fragmente
-    (LinkedIn-URL-Brüche etc.) nicht in den Main-Bereich bluten.
-    """
+    """Read PDF bytes and return (sidebar_text, main_text) across all pages."""
     sidebar_parts: list[str] = []
     main_parts: list[str] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -94,7 +114,7 @@ def _extract_columns(pdf_bytes: bytes) -> tuple[str, str]:
 
 
 def _words_to_text(words: list[dict]) -> str:
-    """Gruppiert Wörter nach Zeile (y-Koordinate) und gibt Text zurück."""
+    """Group extracted words into text lines by y coordinate."""
     if not words:
         return ""
     lines: list[list[dict]] = []
@@ -115,23 +135,23 @@ def _words_to_text(words: list[dict]) -> str:
 
 
 def _clean_lines(text: str) -> list[str]:
-    """Trimmt + entfernt leere Zeilen + Page-Footer."""
+    """Trim empty lines and remove page footers."""
     return [
         l.strip() for l in text.split("\n")
         if l.strip() and not re.match(r"^Page \d+ of \d+$", l.strip(), re.I)
     ]
 
 
-# ── Sidebar-Parser ────────────────────────────────────────────────────────────
+# Sidebar parser
 
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 LINKEDIN_URL_RE = re.compile(r"(www\.)?linkedin\.com/(in/[A-Za-z0-9\-_/]+)", re.I)
 
 
 def _parse_sidebar(text: str) -> dict:
-    """Extrahiert Email, LinkedIn-URL, Skills, Sprachen aus der Sidebar."""
+    """Extract email, profile URL, skills, and languages from the sidebar."""
     lines = _clean_lines(text)
-    # Sidebar-Sektionen finden über deutsche/englische Header
+    # Find sidebar sections via German/English headers.
     sections: dict[str, list[str]] = {}
     current = None
     for line in lines:
@@ -147,7 +167,7 @@ def _parse_sidebar(text: str) -> dict:
 
     out: dict = {"email": None, "linkedin": None, "skills": [], "languages": []}
 
-    # Email aus einzelnen Zeilen extrahieren
+    # Extract email from individual lines.
     for line in sections.get("kontakt", []):
         if not out["email"]:
             m = EMAIL_RE.search(line)
@@ -155,7 +175,7 @@ def _parse_sidebar(text: str) -> dict:
                 out["email"] = m.group(0)
                 break
 
-    # LinkedIn-URL: ganze Sektion zusammenkleben (URLs werden in PDF oft umgebrochen)
+    # Profile URLs often wrap across PDF lines, so join the entire contact section.
     joined = re.sub(r"\s+", "", " ".join(sections.get("kontakt", [])))
     m = LINKEDIN_URL_RE.search(joined)
     if m:
@@ -168,7 +188,6 @@ def _parse_sidebar(text: str) -> dict:
             out["skills"].append(line)
 
     for line in sections.get("sprachen", []):
-        # Beispiel: "Französisch (Limited Working)"
         m = re.match(r"^(.+?)\s*\((.+)\)\s*$", line)
         if m:
             out["languages"].append({"name": m.group(1).strip(), "level": m.group(2).strip()})
@@ -178,21 +197,19 @@ def _parse_sidebar(text: str) -> dict:
     return out
 
 
-# ── Main-Parser ───────────────────────────────────────────────────────────────
+# Main parser
 
 def _parse_header(lines: list[str]) -> dict:
-    """Erste 3 Zeilen: Name, Headline, Standort."""
+    """Parse the first profile lines into name, headline, and location."""
     out = {"name": None, "headline": None, "location": None}
     if len(lines) >= 1:
         out["name"] = lines[0]
     if len(lines) >= 2:
         out["headline"] = lines[1]
     if len(lines) >= 3:
-        # Headline kann sich auf 2 Zeilen erstrecken — Standort enthält typisch ", Deutschland" / ", Germany"
         for i in range(1, min(len(lines), 4)):
             if re.search(r",\s*(Deutschland|Germany|Österreich|Austria|Schweiz|Switzerland)$", lines[i], re.I):
                 out["location"] = lines[i]
-                # Headline ist alles dazwischen
                 out["headline"] = " ".join(lines[1:i]).strip()
                 break
     return out
@@ -201,13 +218,16 @@ def _parse_header(lines: list[str]) -> dict:
 def _is_section_header(line: str) -> Optional[str]:
     low = line.lower().rstrip(":")
     if low in SECTION_HEADERS:
+        for canonical, aliases in SECTION_ALIASES.items():
+            if low in aliases:
+                return canonical
         return low
     return None
 
 
 def _split_main_sections(lines: list[str]) -> dict[str, list[str]]:
-    """Schneidet den Main-Text in Abschnitte anhand der Section-Header."""
-    sections: dict[str, list[str]] = {"header": [], "berufserfahrung": [], "ausbildung": []}
+    """Split main text into sections by section headers."""
+    sections: dict[str, list[str]] = {"header": [], "experience": [], "education": []}
     current = "header"
     for line in lines:
         sec = _is_section_header(line)
@@ -219,14 +239,14 @@ def _split_main_sections(lines: list[str]) -> dict[str, list[str]]:
     return sections
 
 
-# ── Berufserfahrung ───────────────────────────────────────────────────────────
+# Experience
 
 def _parse_date_range(line: str) -> tuple[Optional[date], Optional[date], bool]:
-    """Beispiel: 'Januar 2026 - Present (5 Monate)' → (date(2026,1,1), None, True)."""
+    """Parse a date range line such as 'January 2026 - Present (5 months)'."""
     m = DATE_LINE_RE.match(line)
     if not m:
         return None, None, False
-    von_m = MONTHS_DE.get(m.group("von_m").lower())
+    von_m = MONTHS.get(m.group("von_m").lower())
     von_y = int(m.group("von_y"))
     von_d = date(von_y, von_m, 1) if von_m else None
     bis_raw = m.group("bis")
@@ -234,7 +254,7 @@ def _parse_date_range(line: str) -> tuple[Optional[date], Optional[date], bool]:
         return von_d, None, True
     bm = re.match(r"^([A-Za-zäöüÄÖÜ]+)\s+(\d{4})$", bis_raw)
     if bm:
-        bis_mn = MONTHS_DE.get(bm.group(1).lower())
+        bis_mn = MONTHS.get(bm.group(1).lower())
         if bis_mn:
             return von_d, date(int(bm.group(2)), bis_mn, 1), False
     return von_d, None, False
@@ -245,32 +265,20 @@ def _derive_art(position: str) -> str:
     for kw, art in ART_KEYWORDS:
         if kw in p:
             return art
-    return "sonstiges"
+    return "other"
 
 
 def _parse_experiences(lines: list[str]) -> list[dict]:
-    """State-Machine über die Berufserfahrungs-Zeilen.
-
-    Jeder Eintrag im LinkedIn-PDF besteht aus:
-      [Firmenname]            ← optional bei Multi-Position am gleichen Unternehmen
-      [Aggregator z.B. '6 Monate']  ← Marker für Multi-Position
-      Position (1-2 Zeilen)
-      Datum (matcht DATE_LINE_RE)
-      Standort
-
-    Wir suchen die Datum-Zeile als Anker und arbeiten von dort.
-    """
+    """Parse work experience lines using date rows as anchors."""
     out: list[dict] = []
     last_company: Optional[str] = None
     i = 0
 
     while i < len(lines):
-        # Skip Section-Header (sicherheitshalber)
         if _is_section_header(lines[i]):
             i += 1
             continue
 
-        # Nächste Datum-Zeile suchen (max 8 Zeilen voraus)
         date_idx: Optional[int] = None
         for j in range(i, min(i + 8, len(lines))):
             if DATE_LINE_RE.match(lines[j]):
@@ -282,22 +290,17 @@ def _parse_experiences(lines: list[str]) -> list[dict]:
 
         block = lines[i:date_idx]
 
-        # Klassifikation:
         if len(block) >= 2 and AGGREGATOR_RE.match(block[1]):
-            # block[0] = neuer Firmenname, block[1] = Aggregator, block[2:] = Position
             company = block[0]
             position_lines = block[2:]
             last_company = company
         elif len(block) >= 1 and AGGREGATOR_RE.match(block[0]):
-            # Multi-Position Folge-Eintrag ohne neue Firmenzeile
             company = last_company
             position_lines = block[1:]
         elif last_company and len(block) == 1:
-            # Nur eine Position-Zeile + last_company gesetzt → gehört zur vorherigen Firma
             company = last_company
             position_lines = block
         else:
-            # Neue Firma (block[0]) + Position (block[1:])
             company = block[0] if block else None
             position_lines = block[1:] if len(block) > 1 else []
             last_company = company
@@ -311,20 +314,20 @@ def _parse_experiences(lines: list[str]) -> list[dict]:
         out.append({
             "company":     company,
             "position":    position,
-            "von":         von.isoformat() if von else None,
-            "bis":         bis.isoformat() if bis else None,
-            "aktuell":     aktuell,
+            "start_date":  von.isoformat() if von else None,
+            "end_date":    bis.isoformat() if bis else None,
+            "current":     aktuell,
             "location":    location,
-            "art":         _derive_art(position),
+            "type":        _derive_art(position),
             "raw_date":    date_line,
         })
 
-        i = date_idx + 2  # nach Datum + Location weiter
+        i = date_idx + 2
 
     return out
 
 
-# ── Ausbildung ────────────────────────────────────────────────────────────────
+# Education
 
 def _parse_abschluss(text: str) -> Optional[str]:
     for pat, target in ABSCHLUSS_MAP:
@@ -334,80 +337,68 @@ def _parse_abschluss(text: str) -> Optional[str]:
 
 
 def _parse_education(lines: list[str]) -> list[dict]:
-    """Einträge wie:
-        Hochschule Bielefeld
-        Bachelor of Science - BS, Mechatronics · (Oktober 2020 - August 2024)
-    oder
-        Rennes School of Business
-        International Business · (September 2025 - Dezember 2025)
-    """
+    """Parse education entries."""
     out: list[dict] = []
     i = 0
     while i < len(lines):
         if _is_section_header(lines[i]):
             i += 1; continue
-        # Zwei Zeilen pro Eintrag (Uni + Details)
         uni = lines[i]
         details = lines[i + 1] if i + 1 < len(lines) else ""
         i += 2
 
-        # Details aufsplitten: "{Abschluss + Studiengang} · ({Datum})"
         date_match = PAREN_DATE_RE.search(details)
         von = bis = None
         if date_match:
-            vm = MONTHS_DE.get(date_match.group("von_m").lower())
+            vm = MONTHS.get(date_match.group("von_m").lower())
             vy = int(date_match.group("von_y"))
             if vm:
                 von = date(vy, vm, 1)
             bm = date_match.group("bis_m")
             by = date_match.group("bis_y")
             if bm and by:
-                bm_n = MONTHS_DE.get(bm.lower())
+                bm_n = MONTHS.get(bm.lower())
                 if bm_n:
                     bis = date(int(by), bm_n, 1)
 
-        # Text vor "·" oder vor "(": Abschluss + Studiengang
         head = re.split(r"\s*[·•]\s*|\s*\(", details, maxsplit=1)[0].strip()
         abschluss = _parse_abschluss(head)
         studiengang = head
-        # "{Abschluss-Bezeichnung}, {Studiengang}"
         if "," in head:
             parts = [p.strip() for p in head.split(",", maxsplit=1)]
             if abschluss and abschluss != parts[0]:
-                # Abschluss steht vorne, Studiengang dahinter
                 studiengang = parts[1]
             elif not abschluss:
-                # Kein Abschluss erkannt, beide Teile als studiengang verwenden
                 studiengang = head
 
         out.append({
-            "universitaet": uni,
-            "abschluss":    abschluss,
-            "studiengang":  studiengang,
-            "von_jahr":     von.year if von else None,
-            "bis_jahr":     bis.year if bis else None,
-            "raw_details":  details,
+            "institution": uni,
+            "degree":      abschluss,
+            "field":       studiengang,
+            "start_year":  von.year if von else None,
+            "end_year":    bis.year if bis else None,
+            "raw_details": details,
         })
 
     return out
 
 
-# ── Standort → Stadt + Bundesland ─────────────────────────────────────────────
+# Location
 
 def _parse_location(loc: str) -> dict:
-    """'Lüneburg, Niedersachsen, Deutschland' → {stadt, bundesland, land}"""
+    """Parse 'City, Region, Country' into structured parts."""
     parts = [p.strip() for p in (loc or "").split(",")]
     return {
-        "stadt":      parts[0] if len(parts) >= 1 else None,
-        "bundesland": parts[1] if len(parts) >= 2 else None,
-        "land":       parts[2] if len(parts) >= 3 else None,
+        "city":    parts[0] if len(parts) >= 1 else None,
+        "region":  parts[1] if len(parts) >= 2 else None,
+        "country": parts[2] if len(parts) >= 3 else None,
     }
 
 
-# ── Hauptfunktion ─────────────────────────────────────────────────────────────
+# Public API
 
-def parse_linkedin_pdf(pdf_bytes: bytes) -> dict:
-    """Hauptfunktion: PDF → strukturierte Daten als Dict."""
+def parse_profile_pdf(pdf_bytes: bytes) -> dict:
+    """Parse profile PDF bytes into structured data with English keys."""
     sidebar_text, main_text = _extract_columns(pdf_bytes)
     sidebar = _parse_sidebar(sidebar_text)
 
@@ -416,17 +407,79 @@ def parse_linkedin_pdf(pdf_bytes: bytes) -> dict:
     header = _parse_header(sections.get("header", []))
 
     return {
-        "kontakt": {
+        "contact": {
             "email":    sidebar["email"],
-            "linkedin": sidebar["linkedin"],
+            "profile_url": sidebar["linkedin"],
         },
         "person": {
             "name":     header["name"],
             "headline": header["headline"],
             "location": _parse_location(header["location"] or ""),
         },
-        "skills":          sidebar["skills"],
-        "languages":       sidebar["languages"],
-        "berufserfahrung": _parse_experiences(sections.get("berufserfahrung", [])),
-        "ausbildung":      _parse_education(sections.get("ausbildung", [])),
+        "skills":     sidebar["skills"],
+        "languages":  sidebar["languages"],
+        "experience": _parse_experiences(sections.get("experience", [])),
+        "education":  _parse_education(sections.get("education", [])),
     }
+
+
+def _legacy_experience(entry: dict) -> dict:
+    return {
+        "company": entry.get("company"),
+        "position": entry.get("position"),
+        "von": entry.get("start_date"),
+        "bis": entry.get("end_date"),
+        "aktuell": entry.get("current", False),
+        "location": entry.get("location"),
+        "art": {
+            "working_student": "werkstudent",
+            "internship": "praktikum",
+            "full_time": "vollzeit",
+            "freelance": "freelance",
+            "other": "sonstiges",
+        }.get(entry.get("type"), entry.get("type")),
+        "raw_date": entry.get("raw_date"),
+    }
+
+
+def _legacy_education(entry: dict) -> dict:
+    return {
+        "universitaet": entry.get("institution"),
+        "abschluss": entry.get("degree"),
+        "studiengang": entry.get("field"),
+        "von_jahr": entry.get("start_year"),
+        "bis_jahr": entry.get("end_year"),
+        "raw_details": entry.get("raw_details"),
+    }
+
+
+def _legacy_location(location: dict) -> dict:
+    return {
+        "stadt": location.get("city"),
+        "bundesland": location.get("region"),
+        "land": location.get("country"),
+    }
+
+
+def to_legacy_dict(parsed: dict) -> dict:
+    """Convert the English output shape to the original German-keyed structure."""
+    return {
+        "kontakt": {
+            "email": parsed.get("contact", {}).get("email"),
+            "linkedin": parsed.get("contact", {}).get("profile_url"),
+        },
+        "person": {
+            "name": parsed.get("person", {}).get("name"),
+            "headline": parsed.get("person", {}).get("headline"),
+            "location": _legacy_location(parsed.get("person", {}).get("location", {}) or {}),
+        },
+        "skills": parsed.get("skills", []),
+        "languages": parsed.get("languages", []),
+        "berufserfahrung": [_legacy_experience(e) for e in parsed.get("experience", [])],
+        "ausbildung": [_legacy_education(e) for e in parsed.get("education", [])],
+    }
+
+
+def parse_linkedin_pdf(pdf_bytes: bytes) -> dict:
+    """Backward-compatible parser returning the original German-keyed structure."""
+    return to_legacy_dict(parse_profile_pdf(pdf_bytes))

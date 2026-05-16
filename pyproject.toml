@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "profile-pdf-parser"
-version = "0.1.2"
+version = "0.2.0"
 description = "Parse manually exported professional profile PDFs into structured profile data."
 readme = "README.md"
 requires-python = ">=3.10"
