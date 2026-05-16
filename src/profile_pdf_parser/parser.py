@@ -7,22 +7,34 @@ It reads local PDF bytes only and returns plain Python dictionaries.
 import io
 import re
 from datetime import date
-from typing import Optional
+from typing import Literal, Optional
 
 import pdfplumber
 
 
+Language = Literal["auto", "de", "en"]
+
 # Constants
 
-MONTHS: dict[str, int] = {
+MONTHS_BY_LANGUAGE: dict[str, dict[str, int]] = {
+    "en": {
     "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
     "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
     "august": 8, "aug": 8, "september": 9, "sept": 9, "sep": 9,
     "october": 10, "oct": 10, "november": 11, "nov": 11,
     "december": 12, "dec": 12,
+    },
+    "de": {
     "januar": 1, "februar": 2, "märz": 3, "marz": 3, "april": 4, "mai": 5, "juni": 6,
     "juli": 7, "august": 8, "september": 9, "sept": 9, "oktober": 10, "okt": 10,
     "november": 11, "nov": 11, "dezember": 12, "dez": 12,
+    },
+}
+
+MONTHS: dict[str, int] = {
+    month: number
+    for months in MONTHS_BY_LANGUAGE.values()
+    for month, number in months.items()
 }
 
 DATE_LINE_RE = re.compile(
@@ -31,10 +43,7 @@ DATE_LINE_RE = re.compile(
     re.I,
 )
 
-AGGREGATOR_RE = re.compile(
-    r"^\d+\s+(Monate?|Jahre?)(\s+\d+\s+Monate?)?\s*$",
-    re.I,
-)
+AGGREGATOR_RE = re.compile(r"^\d+\s+\w+(\s+\d+\s+\w+)?\s*$", re.I)
 
 # "(October 2024)" or "(October 2020 - August 2024)"
 PAREN_DATE_RE = re.compile(
@@ -44,30 +53,27 @@ PAREN_DATE_RE = re.compile(
 )
 
 # Section markers in the main content area.
-SECTION_HEADERS = {
-    "experience",
-    "work experience",
-    "professional experience",
-    "berufserfahrung",
-    "erfahrung",
-    "education",
-    "ausbildung",
-    "skills",
-    "top skills",
-    "kenntnisse",
-    "languages",
-    "sprachen",
-    "publications",
-    "publikationen",
-    "patents",
-    "patente",
-    "honors & awards",
-    "auszeichnungen",
+SECTION_ALIASES_BY_LANGUAGE = {
+    "en": {
+        "experience": {"experience", "work experience", "professional experience"},
+        "education": {"education"},
+        "skills": {"skills", "top skills"},
+        "languages": {"languages"},
+        "ignored": {"publications", "patents", "honors & awards"},
+    },
+    "de": {
+        "experience": {"berufserfahrung", "erfahrung"},
+        "education": {"ausbildung"},
+        "skills": {"kenntnisse", "top-kenntnisse"},
+        "languages": {"sprachen"},
+        "ignored": {"publikationen", "patente", "auszeichnungen"},
+    },
 }
-
-SECTION_ALIASES = {
-    "experience": {"experience", "work experience", "professional experience", "berufserfahrung", "erfahrung"},
-    "education": {"education", "ausbildung"},
+SECTION_HEADERS = {
+    header
+    for sections in SECTION_ALIASES_BY_LANGUAGE.values()
+    for aliases in sections.values()
+    for header in aliases
 }
 
 # Degree mapping from profile PDFs to compact labels.
@@ -85,17 +91,63 @@ ABSCHLUSS_MAP: list[tuple[re.Pattern, str]] = [
 ]
 
 # Derive experience type from the job title.
-ART_KEYWORDS: list[tuple[str, str]] = [
-    ("werkstudent", "working_student"),
-    ("working student", "working_student"),
-    ("praktikum", "internship"),
-    ("intern", "internship"),
-    ("internship", "internship"),
-    ("freelance", "freelance"),
-    ("freelancer", "freelance"),
-    ("vollzeit", "full_time"),
-    ("full-time", "full_time"),
-]
+ART_KEYWORDS_BY_LANGUAGE: dict[str, list[tuple[str, str]]] = {
+    "en": [
+        ("working student", "working_student"),
+        ("internship", "internship"),
+        ("intern", "internship"),
+        ("freelance", "freelance"),
+        ("freelancer", "freelance"),
+        ("full-time", "full_time"),
+        ("full time", "full_time"),
+    ],
+    "de": [
+        ("werkstudent", "working_student"),
+        ("praktikum", "internship"),
+        ("freelance", "freelance"),
+        ("freelancer", "freelance"),
+        ("vollzeit", "full_time"),
+    ],
+}
+
+
+def _normalize_language(language: str) -> Language:
+    if language not in {"auto", "de", "en"}:
+        raise ValueError("language must be one of: auto, de, en")
+    return language  # type: ignore[return-value]
+
+
+def _language_order(language: Language) -> list[str]:
+    if language == "auto":
+        return ["en", "de"]
+    other = "en" if language == "de" else "de"
+    return [language, other]
+
+
+def _month_lookup(language: Language) -> dict[str, int]:
+    if language == "auto":
+        return MONTHS
+    return MONTHS_BY_LANGUAGE[language]
+
+
+def _detect_language(sidebar_text: str, main_text: str) -> Literal["de", "en"]:
+    text = f"{sidebar_text}\n{main_text}".lower()
+    de_hits = sum(1 for token in ("berufserfahrung", "ausbildung", "kenntnisse", "sprachen", "kontakt") if token in text)
+    en_hits = sum(1 for token in ("experience", "education", "skills", "languages", "contact") if token in text)
+    return "de" if de_hits > en_hits else "en"
+
+
+def _sidebar_section(line: str, language: Language) -> Optional[str]:
+    low = line.lower().rstrip(":")
+    if low in {"kontakt", "contact"}:
+        return "contact"
+    for lang in _language_order(language):
+        aliases = SECTION_ALIASES_BY_LANGUAGE[lang]
+        if low in aliases["skills"]:
+            return "skills"
+        if low in aliases["languages"]:
+            return "languages"
+    return None
 
 
 # PDF to text
@@ -148,27 +200,25 @@ EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 LINKEDIN_URL_RE = re.compile(r"(www\.)?linkedin\.com/(in/[A-Za-z0-9\-_/]+)", re.I)
 
 
-def _parse_sidebar(text: str) -> dict:
+def _parse_sidebar(text: str, language: Language = "auto") -> dict:
     """Extract email, profile URL, skills, and languages from the sidebar."""
     lines = _clean_lines(text)
     # Find sidebar sections via German/English headers.
     sections: dict[str, list[str]] = {}
     current = None
     for line in lines:
-        low = line.lower().rstrip(":")
-        if low in {"kontakt", "contact"}:
-            current = "kontakt"; sections[current] = []; continue
-        if low in {"top-kenntnisse", "kenntnisse", "top skills", "skills"}:
-            current = "skills"; sections[current] = []; continue
-        if low in {"languages", "sprachen"}:
-            current = "sprachen"; sections[current] = []; continue
+        section = _sidebar_section(line, language)
+        if section:
+            current = section
+            sections[current] = []
+            continue
         if current:
             sections[current].append(line)
 
     out: dict = {"email": None, "linkedin": None, "skills": [], "languages": []}
 
     # Extract email from individual lines.
-    for line in sections.get("kontakt", []):
+    for line in sections.get("contact", []):
         if not out["email"]:
             m = EMAIL_RE.search(line)
             if m:
@@ -176,7 +226,7 @@ def _parse_sidebar(text: str) -> dict:
                 break
 
     # Profile URLs often wrap across PDF lines, so join the entire contact section.
-    joined = re.sub(r"\s+", "", " ".join(sections.get("kontakt", [])))
+    joined = re.sub(r"\s+", "", " ".join(sections.get("contact", [])))
     m = LINKEDIN_URL_RE.search(joined)
     if m:
         url = m.group(0).rstrip("/").rstrip("-")
@@ -187,7 +237,7 @@ def _parse_sidebar(text: str) -> dict:
         if line:
             out["skills"].append(line)
 
-    for line in sections.get("sprachen", []):
+    for line in sections.get("languages", []):
         m = re.match(r"^(.+?)\s*\((.+)\)\s*$", line)
         if m:
             out["languages"].append({"name": m.group(1).strip(), "level": m.group(2).strip()})
@@ -215,22 +265,23 @@ def _parse_header(lines: list[str]) -> dict:
     return out
 
 
-def _is_section_header(line: str) -> Optional[str]:
+def _is_section_header(line: str, language: Language = "auto") -> Optional[str]:
     low = line.lower().rstrip(":")
     if low in SECTION_HEADERS:
-        for canonical, aliases in SECTION_ALIASES.items():
-            if low in aliases:
-                return canonical
+        for lang in _language_order(language):
+            for canonical, aliases in SECTION_ALIASES_BY_LANGUAGE[lang].items():
+                if low in aliases:
+                    return canonical if canonical != "ignored" else low
         return low
     return None
 
 
-def _split_main_sections(lines: list[str]) -> dict[str, list[str]]:
+def _split_main_sections(lines: list[str], language: Language = "auto") -> dict[str, list[str]]:
     """Split main text into sections by section headers."""
     sections: dict[str, list[str]] = {"header": [], "experience": [], "education": []}
     current = "header"
     for line in lines:
-        sec = _is_section_header(line)
+        sec = _is_section_header(line, language)
         if sec is not None:
             current = sec
             sections.setdefault(current, [])
@@ -241,12 +292,13 @@ def _split_main_sections(lines: list[str]) -> dict[str, list[str]]:
 
 # Experience
 
-def _parse_date_range(line: str) -> tuple[Optional[date], Optional[date], bool]:
+def _parse_date_range(line: str, language: Language = "auto") -> tuple[Optional[date], Optional[date], bool]:
     """Parse a date range line such as 'January 2026 - Present (5 months)'."""
     m = DATE_LINE_RE.match(line)
     if not m:
         return None, None, False
-    von_m = MONTHS.get(m.group("von_m").lower())
+    months = _month_lookup(language)
+    von_m = months.get(m.group("von_m").lower())
     von_y = int(m.group("von_y"))
     von_d = date(von_y, von_m, 1) if von_m else None
     bis_raw = m.group("bis")
@@ -254,28 +306,29 @@ def _parse_date_range(line: str) -> tuple[Optional[date], Optional[date], bool]:
         return von_d, None, True
     bm = re.match(r"^([A-Za-zäöüÄÖÜ]+)\s+(\d{4})$", bis_raw)
     if bm:
-        bis_mn = MONTHS.get(bm.group(1).lower())
+        bis_mn = months.get(bm.group(1).lower())
         if bis_mn:
             return von_d, date(int(bm.group(2)), bis_mn, 1), False
     return von_d, None, False
 
 
-def _derive_art(position: str) -> str:
+def _derive_art(position: str, language: Language = "auto") -> str:
     p = (position or "").lower()
-    for kw, art in ART_KEYWORDS:
-        if kw in p:
-            return art
+    for lang in _language_order(language):
+        for kw, art in ART_KEYWORDS_BY_LANGUAGE[lang]:
+            if kw in p:
+                return art
     return "other"
 
 
-def _parse_experiences(lines: list[str]) -> list[dict]:
+def _parse_experiences(lines: list[str], language: Language = "auto") -> list[dict]:
     """Parse work experience lines using date rows as anchors."""
     out: list[dict] = []
     last_company: Optional[str] = None
     i = 0
 
     while i < len(lines):
-        if _is_section_header(lines[i]):
+        if _is_section_header(lines[i], language):
             i += 1
             continue
 
@@ -309,7 +362,7 @@ def _parse_experiences(lines: list[str]) -> list[dict]:
         location = lines[date_idx + 1] if date_idx + 1 < len(lines) else ""
 
         position = " ".join(position_lines).strip()
-        von, bis, aktuell = _parse_date_range(date_line)
+        von, bis, aktuell = _parse_date_range(date_line, language)
 
         out.append({
             "company":     company,
@@ -318,7 +371,7 @@ def _parse_experiences(lines: list[str]) -> list[dict]:
             "end_date":    bis.isoformat() if bis else None,
             "current":     aktuell,
             "location":    location,
-            "type":        _derive_art(position),
+            "type":        _derive_art(position, language),
             "raw_date":    date_line,
         })
 
@@ -336,12 +389,12 @@ def _parse_abschluss(text: str) -> Optional[str]:
     return None
 
 
-def _parse_education(lines: list[str]) -> list[dict]:
+def _parse_education(lines: list[str], language: Language = "auto") -> list[dict]:
     """Parse education entries."""
     out: list[dict] = []
     i = 0
     while i < len(lines):
-        if _is_section_header(lines[i]):
+        if _is_section_header(lines[i], language):
             i += 1; continue
         uni = lines[i]
         details = lines[i + 1] if i + 1 < len(lines) else ""
@@ -350,14 +403,15 @@ def _parse_education(lines: list[str]) -> list[dict]:
         date_match = PAREN_DATE_RE.search(details)
         von = bis = None
         if date_match:
-            vm = MONTHS.get(date_match.group("von_m").lower())
+            months = _month_lookup(language)
+            vm = months.get(date_match.group("von_m").lower())
             vy = int(date_match.group("von_y"))
             if vm:
                 von = date(vy, vm, 1)
             bm = date_match.group("bis_m")
             by = date_match.group("bis_y")
             if bm and by:
-                bm_n = MONTHS.get(bm.lower())
+                bm_n = months.get(bm.lower())
                 if bm_n:
                     bis = date(int(by), bm_n, 1)
 
@@ -397,13 +451,20 @@ def _parse_location(loc: str) -> dict:
 
 # Public API
 
-def parse_profile_pdf(pdf_bytes: bytes) -> dict:
-    """Parse profile PDF bytes into structured data with English keys."""
+def parse_profile_pdf(pdf_bytes: bytes, language: Language = "auto") -> dict:
+    """Parse profile PDF bytes into structured data with English keys.
+
+    Args:
+        pdf_bytes: PDF file content.
+        language: CV/profile PDF language. Use "de", "en", or "auto".
+    """
+    language = _normalize_language(language)
     sidebar_text, main_text = _extract_columns(pdf_bytes)
-    sidebar = _parse_sidebar(sidebar_text)
+    effective_language: Language = _detect_language(sidebar_text, main_text) if language == "auto" else language
+    sidebar = _parse_sidebar(sidebar_text, effective_language)
 
     main_lines = _clean_lines(main_text)
-    sections = _split_main_sections(main_lines)
+    sections = _split_main_sections(main_lines, effective_language)
     header = _parse_header(sections.get("header", []))
 
     return {
@@ -418,8 +479,8 @@ def parse_profile_pdf(pdf_bytes: bytes) -> dict:
         },
         "skills":     sidebar["skills"],
         "languages":  sidebar["languages"],
-        "experience": _parse_experiences(sections.get("experience", [])),
-        "education":  _parse_education(sections.get("education", [])),
+        "experience": _parse_experiences(sections.get("experience", []), effective_language),
+        "education":  _parse_education(sections.get("education", []), effective_language),
     }
 
 
@@ -480,6 +541,6 @@ def to_legacy_dict(parsed: dict) -> dict:
     }
 
 
-def parse_linkedin_pdf(pdf_bytes: bytes) -> dict:
+def parse_linkedin_pdf(pdf_bytes: bytes, language: Language = "auto") -> dict:
     """Backward-compatible parser returning the original German-keyed structure."""
-    return to_legacy_dict(parse_profile_pdf(pdf_bytes))
+    return to_legacy_dict(parse_profile_pdf(pdf_bytes, language=language))

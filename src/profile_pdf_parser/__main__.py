@@ -30,13 +30,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Write the backward-compatible German-keyed output shape.",
     )
+    parser.add_argument(
+        "--language",
+        choices=("auto", "de", "en"),
+        default="auto",
+        help="Profile PDF language. Defaults to auto.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     parse = parse_linkedin_pdf if args.legacy else parse_profile_pdf
-    parsed = parse(args.pdf.read_bytes())
+    parsed = parse(args.pdf.read_bytes(), language=args.language)
     indent = None if args.indent == 0 else args.indent
     payload = json.dumps(parsed, ensure_ascii=False, indent=indent)
 

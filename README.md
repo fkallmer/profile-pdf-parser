@@ -13,7 +13,7 @@ Corporation. LinkedIn is a trademark of LinkedIn Corporation and its affiliates.
 ## Install
 
 ```bash
-pip install "profile-pdf-parser @ https://github.com/fkallmer/profile-pdf-parser/archive/refs/tags/v0.2.0.zip"
+pip install "profile-pdf-parser @ https://github.com/fkallmer/profile-pdf-parser/archive/refs/tags/v0.3.0.zip"
 ```
 
 ## Python Usage
@@ -24,7 +24,7 @@ from pathlib import Path
 from profile_pdf_parser import parse_profile_pdf
 
 pdf_bytes = Path("Profile.pdf").read_bytes()
-profile = parse_profile_pdf(pdf_bytes)
+profile = parse_profile_pdf(pdf_bytes, language="auto")
 
 print(profile["person"]["name"])
 print(profile["experience"][0]["company"])
@@ -67,6 +67,13 @@ Write the backward-compatible German-keyed output:
 
 ```bash
 profile-pdf-parser Profile.pdf --legacy -o profile.legacy.json
+```
+
+Select the profile PDF language explicitly when you know it:
+
+```bash
+profile-pdf-parser Profile.pdf --language de -o profile.json
+profile-pdf-parser Profile.pdf --language en -o profile.json
 ```
 
 ## Output Shape
@@ -157,6 +164,12 @@ Example JSON shape:
 This parser is best-effort and currently optimized for German and English
 LinkedIn profile PDF exports. It recognizes German and English section headers
 and month names. Other locales may work partially, but they are not tested yet.
+
+Use `language="auto"` for automatic detection, or pass `language="de"` /
+`language="en"` when your integration already knows the export language. Section
+headers are recognized across both supported languages because LinkedIn exports
+can contain mixed labels such as German profile sections with an English
+`Languages` sidebar heading.
 
 ## Runtime Dependency
 
