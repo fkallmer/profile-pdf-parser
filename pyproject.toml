@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "profile-pdf-parser"
-version = "0.1.1"
+version = "0.1.2"
 description = "Parse manually exported professional profile PDFs into structured profile data."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,6 +26,9 @@ classifiers = [
 Homepage = "https://github.com/fkallmer/profile-pdf-parser"
 Repository = "https://github.com/fkallmer/profile-pdf-parser"
 Issues = "https://github.com/fkallmer/profile-pdf-parser/issues"
+
+[project.scripts]
+profile-pdf-parser = "profile_pdf_parser.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
