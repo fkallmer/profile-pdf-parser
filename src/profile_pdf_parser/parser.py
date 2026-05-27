@@ -6,13 +6,68 @@ It reads local PDF bytes only and returns plain Python dictionaries.
 
 import io
 import re
+from collections import Counter
 from datetime import date
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 
 import pdfplumber
 
 
 Language = Literal["auto", "de", "en"]
+
+# Document Structure
+
+class Line(str):
+    """A string subclass that also stores its font size."""
+    def __new__(cls, text: str, size: float):
+        obj = str.__new__(cls, text)
+        obj.size = size
+        return obj
+
+    def __repr__(self):
+        return f"Line({self.size:.2f}, {super().__repr__()})"
+
+
+class FontSizeModel:
+    """Heuristic model to identify document structure levels based on font sizes."""
+    def __init__(self, sizes: list[float]):
+        if not sizes:
+            self.base = 10.5
+            self.header = 15.75
+            self.org = 12.0
+            self.role = 11.5
+            return
+
+        counts = Counter(sizes)
+        # The most frequent size is usually the body/metadata size.
+        self.base = counts.most_common(1)[0][0]
+
+        # Section headers are significantly larger.
+        larger = sorted([s for s in counts if s >= self.base * 1.4], reverse=True)
+        self.header = larger[-1] if larger else self.base * 1.5
+
+        # Level 1 (Org) and Level 2 (Role) are between base and header.
+        mid_counts = [(s, c) for s, c in counts.items() if self.base < s < self.header and s >= self.base * 1.05]
+        # Sort by frequency (count) descending
+        mid_by_freq = sorted(mid_counts, key=lambda x: x[1], reverse=True)
+        
+        self.org = mid_by_freq[0][0] if len(mid_by_freq) >= 1 else self.base * 1.15
+        self.role = mid_by_freq[1][0] if len(mid_by_freq) >= 2 else self.org
+
+        # Sometimes LinkedIn uses the same size for org and role if not multiple positions.
+        # Ensure org is at least as large as role for consistency.
+        if self.role > self.org:
+            self.org, self.role = self.role, self.org
+
+    def is_header(self, size: float) -> bool:
+        return size >= self.header - 0.1
+
+    def is_org(self, size: float) -> bool:
+        return abs(size - self.org) < 0.1
+
+    def is_role(self, size: float) -> bool:
+        return abs(size - self.role) < 0.1
+
 
 # Constants
 
@@ -130,8 +185,8 @@ def _month_lookup(language: Language) -> dict[str, int]:
     return MONTHS_BY_LANGUAGE[language]
 
 
-def _detect_language(sidebar_text: str, main_text: str) -> Literal["de", "en"]:
-    text = f"{sidebar_text}\n{main_text}".lower()
+def _detect_language(sidebar_lines: list[Line], main_lines: list[Line]) -> Literal["de", "en"]:
+    text = "\n".join(sidebar_lines + main_lines).lower()
     de_hits = sum(1 for token in ("berufserfahrung", "ausbildung", "kenntnisse", "sprachen", "kontakt") if token in text)
     en_hits = sum(1 for token in ("experience", "education", "skills", "languages", "contact") if token in text)
     return "de" if de_hits > en_hits else "en"
@@ -152,23 +207,32 @@ def _sidebar_section(line: str, language: Language) -> Optional[str]:
 
 # PDF to text
 
-def _extract_columns(pdf_bytes: bytes) -> tuple[str, str]:
-    """Read PDF bytes and return (sidebar_text, main_text) across all pages."""
-    sidebar_parts: list[str] = []
-    main_parts: list[str] = []
+def _extract_columns(pdf_bytes: bytes) -> tuple[list[Line], list[Line], FontSizeModel]:
+    """Read PDF bytes and return (sidebar_lines, main_lines, font_model) across all pages."""
+    all_sizes = []
+    pages_data = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             split = page.width * 0.30
-            words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
-            sidebar_parts.append(_words_to_text([w for w in words if w["x1"] <= split]))
-            main_parts.append(_words_to_text([w for w in words if w["x0"] >= split]))
-    return "\n".join(sidebar_parts), "\n".join(main_parts)
+            words = page.extract_words(use_text_flow=True, keep_blank_chars=False, extra_attrs=["size"])
+            all_sizes.extend([round(w["size"], 2) for w in words])
+            pages_data.append((split, words))
+
+    model = FontSizeModel(all_sizes)
+    sidebar_lines: list[Line] = []
+    main_lines: list[Line] = []
+
+    for split, words in pages_data:
+        sidebar_lines.extend(_words_to_lines([w for w in words if w["x1"] <= split]))
+        main_lines.extend(_words_to_lines([w for w in words if w["x0"] >= split]))
+
+    return sidebar_lines, main_lines, model
 
 
-def _words_to_text(words: list[dict]) -> str:
-    """Group extracted words into text lines by y coordinate."""
+def _words_to_lines(words: list[dict]) -> list[Line]:
+    """Group extracted words into Line objects by y coordinate."""
     if not words:
-        return ""
+        return []
     lines: list[list[dict]] = []
     current: list[dict] = []
     current_y: Optional[float] = None
@@ -183,13 +247,19 @@ def _words_to_text(words: list[dict]) -> str:
             current_y = y
     if current:
         lines.append(current)
-    return "\n".join(" ".join(w["text"] for w in line) for line in lines)
+
+    out = []
+    for line in lines:
+        text = " ".join(w["text"] for w in line)
+        size = max(w["size"] for w in line)
+        out.append(Line(text, round(size, 2)))
+    return out
 
 
-def _clean_lines(text: str) -> list[str]:
+def _clean_lines(lines: list[Line]) -> list[Line]:
     """Trim empty lines and remove page footers."""
     return [
-        l.strip() for l in text.split("\n")
+        l for l in lines
         if l.strip() and not re.match(r"^Page \d+ of \d+$", l.strip(), re.I)
     ]
 
@@ -200,9 +270,9 @@ EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 LINKEDIN_URL_RE = re.compile(r"(www\.)?linkedin\.com/(in/[A-Za-z0-9\-_/]+)", re.I)
 
 
-def _parse_sidebar(text: str, language: Language = "auto") -> dict:
+def _parse_sidebar(lines: list[Line], language: Language = "auto") -> dict:
     """Extract email, profile URL, skills, and languages from the sidebar."""
-    lines = _clean_lines(text)
+    lines = _clean_lines(lines)
     # Find sidebar sections via German/English headers.
     sections: dict[str, list[str]] = {}
     current = None
@@ -265,7 +335,11 @@ def _parse_header(lines: list[str]) -> dict:
     return out
 
 
-def _is_section_header(line: str, language: Language = "auto") -> Optional[str]:
+def _is_section_header(line: Line, model: FontSizeModel, language: Language = "auto") -> Optional[str]:
+    # Section headers must be larger than base text.
+    if not model.is_header(line.size):
+        return None
+
     low = line.lower().rstrip(":")
     if low in SECTION_HEADERS:
         for lang in _language_order(language):
@@ -276,12 +350,12 @@ def _is_section_header(line: str, language: Language = "auto") -> Optional[str]:
     return None
 
 
-def _split_main_sections(lines: list[str], language: Language = "auto") -> dict[str, list[str]]:
+def _split_main_sections(lines: list[Line], model: FontSizeModel, language: Language = "auto") -> dict[str, list[Line]]:
     """Split main text into sections by section headers."""
-    sections: dict[str, list[str]] = {"header": [], "experience": [], "education": []}
+    sections: dict[str, list[Line]] = {"header": [], "experience": [], "education": []}
     current = "header"
     for line in lines:
-        sec = _is_section_header(line, language)
+        sec = _is_section_header(line, model, language)
         if sec is not None:
             current = sec
             sections.setdefault(current, [])
@@ -316,66 +390,67 @@ def _derive_art(position: str, language: Language = "auto") -> str:
     p = (position or "").lower()
     for lang in _language_order(language):
         for kw, art in ART_KEYWORDS_BY_LANGUAGE[lang]:
-            if kw in p:
+            # Use word boundaries to avoid matching substrings (e.g., "Engineering" matching "intern")
+            if re.search(rf"\b{re.escape(kw)}\b", p, re.I):
                 return art
     return "other"
 
 
-def _parse_experiences(lines: list[str], language: Language = "auto") -> list[dict]:
-    """Parse work experience lines using date rows as anchors."""
+def _parse_experiences(lines: list[Line], model: FontSizeModel, language: Language = "auto") -> list[dict]:
+    """Parse work experience lines using font sizes and date anchors."""
     out: list[dict] = []
-    last_company: Optional[str] = None
+    current_company: Optional[str] = None
     i = 0
 
     while i < len(lines):
-        if _is_section_header(lines[i], language):
+        line = lines[i]
+
+        if _is_section_header(line, model, language):
             i += 1
             continue
 
-        date_idx: Optional[int] = None
-        for j in range(i, min(i + 8, len(lines))):
-            if DATE_LINE_RE.match(lines[j]):
-                date_idx = j
-                break
+        # Org Level (Company)
+        if model.is_org(line.size):
+            current_company = line
+            i += 1
+            # Optional: Skip total duration aggregator line (e.g. "4 years 8 months")
+            if i < len(lines) and AGGREGATOR_RE.match(lines[i]):
+                i += 1
+            continue
 
-        if date_idx is None:
-            break
+        # Role Level (Position)
+        if model.is_role(line.size):
+            position = line
+            i += 1
+            date_line = None
+            location = None
+            # Collect metadata until the next Org or Role
+            while i < len(lines) and not model.is_org(lines[i].size) and not model.is_role(lines[i].size):
+                l = lines[i]
+                if DATE_LINE_RE.match(l) and not date_line:
+                    date_line = l
+                elif not location and not AGGREGATOR_RE.match(l) and not _is_section_header(l, model, language):
+                    location = l
+                i += 1
 
-        block = lines[i:date_idx]
+            if date_line:
+                von, bis, aktuell = _parse_date_range(date_line, language)
+                out.append({
+                    "company":     current_company,
+                    "position":    position,
+                    "start_date":  von.isoformat() if von else None,
+                    "end_date":    bis.isoformat() if bis else None,
+                    "current":     aktuell,
+                    "location":    location or "",
+                    "type":        _derive_art(position, language),
+                    "raw_date":    date_line,
+                })
+            continue
 
-        if len(block) >= 2 and AGGREGATOR_RE.match(block[1]):
-            company = block[0]
-            position_lines = block[2:]
-            last_company = company
-        elif len(block) >= 1 and AGGREGATOR_RE.match(block[0]):
-            company = last_company
-            position_lines = block[1:]
-        elif last_company and len(block) == 1:
-            company = last_company
-            position_lines = block
-        else:
-            company = block[0] if block else None
-            position_lines = block[1:] if len(block) > 1 else []
-            last_company = company
-
-        date_line = lines[date_idx]
-        location = lines[date_idx + 1] if date_idx + 1 < len(lines) else ""
-
-        position = " ".join(position_lines).strip()
-        von, bis, aktuell = _parse_date_range(date_line, language)
-
-        out.append({
-            "company":     company,
-            "position":    position,
-            "start_date":  von.isoformat() if von else None,
-            "end_date":    bis.isoformat() if bis else None,
-            "current":     aktuell,
-            "location":    location,
-            "type":        _derive_art(position, language),
-            "raw_date":    date_line,
-        })
-
-        i = date_idx + 2
+        # Fallback for unexpected formats
+        if not current_company and not model.is_header(line.size):
+            current_company = line
+        i += 1
 
     return out
 
@@ -389,50 +464,63 @@ def _parse_abschluss(text: str) -> Optional[str]:
     return None
 
 
-def _parse_education(lines: list[str], language: Language = "auto") -> list[dict]:
-    """Parse education entries."""
+def _parse_education(lines: list[Line], model: FontSizeModel, language: Language = "auto") -> list[dict]:
+    """Parse education entries using font sizes."""
     out: list[dict] = []
     i = 0
     while i < len(lines):
-        if _is_section_header(lines[i], language):
-            i += 1; continue
-        uni = lines[i]
-        details = lines[i + 1] if i + 1 < len(lines) else ""
-        i += 2
+        line = lines[i]
+        if _is_section_header(line, model, language):
+            i += 1
+            continue
 
-        date_match = PAREN_DATE_RE.search(details)
-        von = bis = None
-        if date_match:
-            months = _month_lookup(language)
-            vm = months.get(date_match.group("von_m").lower())
-            vy = int(date_match.group("von_y"))
-            if vm:
-                von = date(vy, vm, 1)
-            bm = date_match.group("bis_m")
-            by = date_match.group("bis_y")
-            if bm and by:
-                bm_n = months.get(bm.lower())
-                if bm_n:
-                    bis = date(int(by), bm_n, 1)
+        # Institution (Org size)
+        if model.is_org(line.size):
+            uni = line
+            i += 1
+            details_lines = []
+            while i < len(lines) and not model.is_org(lines[i].size) and not _is_section_header(lines[i], model, language):
+                details_lines.append(lines[i])
+                i += 1
+            
+            details = " ".join(details_lines)
+            
+            date_match = PAREN_DATE_RE.search(details)
+            von = bis = None
+            if date_match:
+                months = _month_lookup(language)
+                vm = months.get(date_match.group("von_m").lower())
+                vy = int(date_match.group("von_y"))
+                if vm:
+                    von = date(vy, vm, 1)
+                bm = date_match.group("bis_m")
+                by = date_match.group("bis_y")
+                if bm and by:
+                    bm_n = months.get(bm.lower())
+                    if bm_n:
+                        bis = date(int(by), bm_n, 1)
 
-        head = re.split(r"\s*[·•]\s*|\s*\(", details, maxsplit=1)[0].strip()
-        abschluss = _parse_abschluss(head)
-        studiengang = head
-        if "," in head:
-            parts = [p.strip() for p in head.split(",", maxsplit=1)]
-            if abschluss and abschluss != parts[0]:
-                studiengang = parts[1]
-            elif not abschluss:
-                studiengang = head
+            head = re.split(r"\s*[·•]\s*|\s*\(", details, maxsplit=1)[0].strip()
+            abschluss = _parse_abschluss(head)
+            studiengang = head
+            if "," in head:
+                parts = [p.strip() for p in head.split(",", maxsplit=1)]
+                if abschluss and abschluss != parts[0]:
+                    studiengang = parts[1]
+                elif not abschluss:
+                    studiengang = head
 
-        out.append({
-            "institution": uni,
-            "degree":      abschluss,
-            "field":       studiengang,
-            "start_year":  von.year if von else None,
-            "end_year":    bis.year if bis else None,
-            "raw_details": details,
-        })
+            out.append({
+                "institution": uni,
+                "degree":      abschluss,
+                "field":       studiengang,
+                "start_year":  von.year if von else None,
+                "end_year":    bis.year if bis else None,
+                "raw_details": details,
+            })
+            continue
+        
+        i += 1
 
     return out
 
@@ -459,12 +547,12 @@ def parse_profile_pdf(pdf_bytes: bytes, language: Language = "auto") -> dict:
         language: CV/profile PDF language. Use "de", "en", or "auto".
     """
     language = _normalize_language(language)
-    sidebar_text, main_text = _extract_columns(pdf_bytes)
-    effective_language: Language = _detect_language(sidebar_text, main_text) if language == "auto" else language
-    sidebar = _parse_sidebar(sidebar_text, effective_language)
+    sidebar_lines, main_lines, model = _extract_columns(pdf_bytes)
+    effective_language: Language = _detect_language(sidebar_lines, main_lines) if language == "auto" else language
+    sidebar = _parse_sidebar(sidebar_lines, effective_language)
 
-    main_lines = _clean_lines(main_text)
-    sections = _split_main_sections(main_lines, effective_language)
+    main_lines = _clean_lines(main_lines)
+    sections = _split_main_sections(main_lines, model, effective_language)
     header = _parse_header(sections.get("header", []))
 
     return {
@@ -479,8 +567,8 @@ def parse_profile_pdf(pdf_bytes: bytes, language: Language = "auto") -> dict:
         },
         "skills":     sidebar["skills"],
         "languages":  sidebar["languages"],
-        "experience": _parse_experiences(sections.get("experience", []), effective_language),
-        "education":  _parse_education(sections.get("education", []), effective_language),
+        "experience": _parse_experiences(sections.get("experience", []), model, effective_language),
+        "education":  _parse_education(sections.get("education", []), model, effective_language),
     }
 
 
